@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<!--
+    SW40 — экран загрузки GMod (sv_loadingurl).
+
+    ЧТО ЭТО. Страница, которую движок показывает вместо стандартного
+    экрана загрузки, пока игрок подключается. Работает ДО того, как
+    запустился хоть один клиентский Lua-файл: из геймода здесь не
+    доступно ничего, только события, которые шлёт сам движок.
+
+    ПОДКЛЮЧЕНИЕ. В server.cfg:
+        sv_loadingurl "https://<хост>/loading/"
+
+    УСТРОЙСТВО. Шесть слайдов по раскадровке поверх одного фона.
+
+    СВОЕЙ ПОЛОСЫ ЗАГРУЗКИ НЕТ НАМЕРЕННО. Движок рисует поверх страницы
+    собственное окно с прогрессом («Workshop Complete!», кнопка Cancel)
+    в правом нижнем углу. Второй индикатор рядом с ним был бы лишним, а
+    сам этот угол страница оставляет пустым — всё, что туда встанет,
+    окно движка закроет.
+
+    ТАЙМИНГ. Раскадровка рассчитана на 30 секунд, а загрузка длится
+    сколько угодно. Поэтому:
+        1 → 2 → 3 → 4 → 5          по пять секунд, по порядку
+        2 → 3 → 4 → 5 → 2 ...     по кругу, пока идёт загрузка
+        6                          когда движок начал загружать Lua
+    Шестой слайд («Готовься к службе») включается по реальному концу
+    загрузки, а не по тридцатой секунде. Иначе на долгом заходе игрок
+    минуту смотрел бы на «Анаксес ждёт». Перед переходом текущий слайд
+    дожидается хотя бы MIN_BEFORE_FINAL, чтобы не обрываться на
+    полуслове.
+
+    ДВА БРАУЗЕРА. У GMod на 64-битной ветке Chromium, на обычной
+    32-битной — старый Awesomium уровня Chrome 18. Поэтому: ES5 без
+    стрелок, let и fetch; CSS без переменных, grid и vh; анимации с
+    -webkit- префиксом. Масштаб — через rem от высоты окна, тот же
+    приём, что T.u() в Lua.
+
+    ФАЙЛЫ РЯДОМ СО СТРАНИЦЕЙ (любой может отсутствовать — страница не
+    сломается, на месте картинки останется пустота):
+        art.png                   фон
+        logo.png                  знак SINTES, белый
+        emblem_republic.png       эмблемы фракций, белые
+        emblem_imperium.png
+        emblem_others.png
+        fonts/GolosText-*.ttf     запасной шрифт для не-Windows
+
+    ПРОВЕРКА В ОБЫЧНОМ БРАУЗЕРЕ:
+        index.html?demo=1          проигрывает заход в реальном времени
+        index.html?demo=1&speed=5  то же, в пять раз быстрее
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>SINTES</title>
+<style>
+    /*
+        Шрифты. Bahnschrift — DIN 1451 из комплекта Windows, браузер
+        берёт его из системы. Golos Text — запасной файлом. Тот же
+        порядок, что в cl_fonts.lua: экран загрузки и игра набраны одним
+        шрифтом, и стык при переходе не виден.
+
+        Три веса. Крупные заголовки на раскадровке тонкие и широко
+        разряженные — под них Light. Жирного нет вовсе.
+    */
+    @font-face {
+        font-family: 'SW40';
+        src: local('Bahnschrift Light'), local('Bahnschrift SemiLight'),
+             url('fonts/GolosText-Regular.ttf') format('truetype');
+        font-weight: 300;
+    }
+    @font-face {
+        font-family: 'SW40';
+        src: local('Bahnschrift'),
+             url('fonts/GolosText-Regular.ttf') format('truetype');
+        font-weight: 400;
+    }
+    @font-face {
+        font-family: 'SW40';
+        src: local('Bahnschrift SemiBold'),
+             url('fonts/GolosText-Medium.ttf') format('truetype');
+        font-weight: 500;
+    }
+
+    html { font-size: 16px; }   /* пересчитывается скриптом */
+
+    html, body {
+        margin: 0; padding: 0;
+        width: 100%; height: 100%;
+        overflow: hidden;
+        background: #05070b;
+        color: #e6e8ea;
+        font-family: 'SW40', 'Segoe UI', Tahoma, sans-serif;
+        font-weight: 400;
+        -webkit-font-smoothing: antialiased;
+        cursor: default;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    /* ── Фон ────────────────────────────────────────────────────────── */
+    /*
+        Один кадр на всё время загрузки, поэтому медленный наезд: за
+        минуту-другую неподвижная картинка начинает выглядеть зависшей.
+        Масштаб меняется на 5% за 40 секунд — заметно боковым зрением,
+        но не отвлекает от текста. Выключить — убрать класс drift у .art.
+    */
+    .art {
+        position: absolute; left: 0; top: 0; right: 0; bottom: 0;
+        background: #05070b url('art.png') 65% center no-repeat;
+        -webkit-background-size: cover;
+        background-size: cover;
+    }
+    .art.drift {
+        -webkit-animation: drift 40s ease-in-out infinite alternate;
+        animation: drift 40s ease-in-out infinite alternate;
+    }
+    @-webkit-keyframes drift { from { -webkit-transform: scale(1); } to { -webkit-transform: scale(1.05); } }
+    @keyframes drift         { from { transform: scale(1); }         to { transform: scale(1.05); } }
+
+    /* Левая треть темнее: текст должен читаться на любом арте */
+    .shade {
+        position: absolute; left: 0; top: 0; bottom: 0;
+        width: 62%;
+        background: -webkit-linear-gradient(left, rgba(5,7,11,0.94) 0%, rgba(5,7,11,0.82) 45%, rgba(5,7,11,0) 100%);
+        background: linear-gradient(to right, rgba(5,7,11,0.94) 0%, rgba(5,7,11,0.82) 45%, rgba(5,7,11,0) 100%);
+    }
+
+    /* ── Слайды ─────────────────────────────────────────────────────── */
+    .stage {
+        position: absolute;
+        left: 4.6rem; top: 0; bottom: 0;
+        width: 36rem;
+    }
+    /*
+        Каждый слайд — во всю высоту сцены, содержимое по центру через
+        таблицу: это единственный способ вертикального центрирования,
+        который одинаково работает в обоих браузерах GMod.
+    */
+    /*
+        Смена слайдов ПОСЛЕДОВАТЕЛЬНАЯ, а не перекрёстная: старый уходит
+        за 0.45 с, новый начинает проявляться только после этого.
+        Перекрёстное растворение годится для картинок, но два блока
+        текста в одном месте на полсекунды смешиваются в нечитаемую кашу.
+    */
+    .slide {
+        position: absolute; left: 0; top: 0;
+        width: 100%; height: 100%;
+        display: table;
+        opacity: 0;
+        -webkit-transition: opacity 0.45s ease;
+        transition: opacity 0.45s ease;
+    }
+    .slide.on {
+        opacity: 1;
+        -webkit-transition: opacity 0.7s ease 0.5s;
+        transition: opacity 0.7s ease 0.5s;
+    }
+    .slide > .in { display: table-cell; vertical-align: middle; }
+
+    /* Общие элементы */
+    .rule {
+        width: 3.4rem; height: 2px;
+        background: #c8922f;
+        margin: 1.8rem 0;
+    }
+    .tag {
+        font-size: 0.95rem;
+        letter-spacing: 0.24rem;
+        line-height: 1.8;
+        color: #9da1a7;
+    }
+    .body {
+        font-size: 1.28rem;
+        line-height: 1.5;
+        color: #c9ccd0;
+        max-width: 30rem;
+    }
+    .head {
+        font-weight: 300;
+        font-size: 3.1rem;
+        letter-spacing: 0.3rem;
+        line-height: 1.15;
+        color: #eef0f2;
+    }
+
+    /* 1 — логотип */
+    .s-logo { text-align: center; }
+    .s-logo img  { height: 7.5rem; display: inline-block; }
+    .s-logo .name {
+        margin-top: 1.8rem;
+        font-weight: 300;
+        font-size: 3.6rem;
+        letter-spacing: 1.1rem;
+        margin-right: -1.1rem;     /* разрядка добавляет хвост справа — компенсируем, иначе центр уедет */
+        color: #eef0f2;
+    }
+    .s-logo .motto {
+        margin-top: 1rem;
+        font-size: 1.1rem;
+        letter-spacing: 0.35rem;
+        color: #c8922f;
+    }
+    .s-logo .rule { margin: 1.8rem auto 0; }
+
+    /* 3 — планета */
+    .s-planet .sub {
+        margin-top: 0.6rem;
+        font-size: 1.15rem;
+        letter-spacing: 0.4rem;
+        color: #9da1a7;
+    }
+    .spec { margin-top: 2rem; border-collapse: collapse; }
+    .spec td {
+        padding: 0.25rem 0;
+        font-size: 0.95rem;
+        letter-spacing: 0.2rem;
+        color: #9da1a7;
+    }
+    .spec td.k { padding-right: 1.4rem; }
+    .spec td.v { color: #c9ccd0; }
+
+    /* 4 — роль */
+    .list { margin-top: 2rem; }
+    .list div {
+        font-size: 0.95rem;
+        letter-spacing: 0.22rem;
+        line-height: 2;
+        color: #c9ccd0;
+    }
+    .list span { color: #c8922f; margin-right: 0.9rem; }
+
+    /* 5 — фракции */
+    .factions { width: 100%; border-collapse: collapse; }
+    .factions td { width: 33.3%; text-align: center; vertical-align: top; }
+    .factions img { height: 5.2rem; display: inline-block; }
+    .factions .fname {
+        margin-top: 1.2rem;
+        font-weight: 500;
+        font-size: 1.05rem;
+        letter-spacing: 0.2rem;
+        color: #eef0f2;
+    }
+    .factions .fvals {
+        margin-top: 1.1rem;
+        font-size: 0.85rem;
+        letter-spacing: 0.2rem;
+        line-height: 1.75;
+        color: #9da1a7;
+    }
+    .s-factions .after { margin-top: 2.4rem; }
+
+    /* 6 — завершение */
+    .s-final .head { font-size: 3.4rem; }
+</style>
+</head>
+<body>
+
+<div class="art drift"></div>
+<div class="shade"></div>
+
+<div class="stage">
+
+    <!-- 1 — Появление логотипа -->
+    <div class="slide s-logo"><div class="in">
+        <img src="logo.png" alt="" onerror="this.style.visibility='hidden'">
+        <div class="name">SINTES</div>
+        <div class="motto">TWO UNIVERSES. ONE PURPOSE.</div>
+        <div class="rule"></div>
+    </div></div>
+
+    <!-- 2 — Описание проекта -->
+    <div class="slide"><div class="in">
+        <div class="tag">STAR WARS × WARHAMMER 40,000<br>ROLEPLAY | DISCIPLINE | UNITY</div>
+        <div class="rule"></div>
+        <div class="body">Sintes — это уникальный ролевой проект, объединяющий
+            две вселенные в одном мире. Здесь сталкиваются разные идеологии,
+            фракции и судьбы, но всех ведёт одна цель — сохранить порядок.</div>
+        <div class="rule"></div>
+        <div class="tag">ПОРЯДОК НАЧИНАЕТСЯ<br>С ДИСЦИПЛИНЫ.</div>
+    </div></div>
+
+    <!-- 3 — Планета -->
+    <div class="slide s-planet"><div class="in">
+        <div class="head">АНАКСЕС</div>
+        <div class="sub">ANAXES</div>
+        <div class="rule"></div>
+        <div class="body">Планета, ставшая точкой соприкосновения двух миров.
+            Стратегически важный объект, на котором размещены совместные
+            военные силы и исследовательские объекты.</div>
+        <table class="spec">
+            <tr><td class="k">ТИП</td><td>:&nbsp;&nbsp;</td><td class="v">СМЕШАННЫЙ МИР</td></tr>
+            <tr><td class="k">СТАТУС</td><td>:&nbsp;&nbsp;</td><td class="v">ПОД КОНТРОЛЕМ</td></tr>
+            <tr><td class="k">СЕКТОР</td><td>:&nbsp;&nbsp;</td><td class="v">A-17</td></tr>
+        </table>
+    </div></div>
+
+    <!-- 4 — Ваша роль -->
+    <div class="slide"><div class="in">
+        <div class="head">БОЛЬШЕ,<br>ЧЕМ ПРОСТО ИГРА</div>
+        <div class="rule"></div>
+        <div class="body">Станьте частью живого мира. Развивайте персонажа,
+            выполняйте приказы, участвуйте в операциях, взаимодействуйте
+            с фракциями и пишите свою историю в галактике, где нет простых
+            решений.</div>
+        <div class="list">
+            <div><span>+</span>СЛУЖБА</div>
+            <div><span>+</span>ВЗАИМОДЕЙСТВИЕ</div>
+            <div><span>+</span>РАЗВИТИЕ</div>
+            <div><span>+</span>ТВОЯ ИСТОРИЯ</div>
+        </div>
+    </div></div>
+
+    <!-- 5 — Фракции -->
+    <div class="slide s-factions"><div class="in">
+        <table class="factions"><tr>
+            <td>
+                <img src="emblem_republic.png" alt="" onerror="this.style.visibility='hidden'">
+                <div class="fname">РЕСПУБЛИКА</div>
+                <div class="fvals">ЧЕСТЬ<br>СЛУЖБА<br>НАДЕЖДА</div>
+            </td>
+            <td>
+                <img src="emblem_imperium.png" alt="" onerror="this.style.visibility='hidden'">
+                <div class="fname">ИМПЕРИУМ</div>
+                <div class="fvals">ВЕРА<br>ДИСЦИПЛИНА<br>ВЫЖИВАНИЕ</div>
+            </td>
+            <td>
+                <img src="emblem_others.png" alt="" onerror="this.style.visibility='hidden'">
+                <div class="fname">ДРУГИЕ</div>
+                <div class="fvals">ЛЮДИ<br>СОБЫТИЯ<br>ТВОЯ ИСТОРИЯ</div>
+            </td>
+        </tr></table>
+        <div class="after">
+            <div class="rule"></div>
+            <div class="tag">РАЗНЫЕ МИРЫ.<br>ОДНА ЦЕЛЬ.</div>
+        </div>
+    </div></div>
+
+    <!-- 6 — Завершение -->
+    <div class="slide s-final"><div class="in">
+        <div class="head">ГОТОВЬСЯ<br>К СЛУЖБЕ</div>
+        <div class="rule"></div>
+        <div class="tag">АНАКСЕС ЖДЁТ.</div>
+    </div></div>
+
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════
+   МАСШТАБ — 1rem = 16px на 1080p, тянется от высоты окна
+   ═══════════════════════════════════════════════════════════════════════ */
+function rescale() {
+    var h = window.innerHeight || document.documentElement.clientHeight || 1080;
+    document.documentElement.style.fontSize = (16 * Math.max(0.6, h / 1080)) + 'px';
+}
+rescale();
+window.onresize = rescale;
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ТАЙМИНГ
+
+   Все числа — в миллисекундах. speed из адреса ускоряет только демо,
+   чтобы не ждать полминуты ради последнего слайда.
+   ═══════════════════════════════════════════════════════════════════════ */
+var SPEED = (function () {
+    var m = /[?&]speed=([0-9.]+)/.exec(window.location.search);
+    return m ? Math.max(0.1, parseFloat(m[1])) : 1;
+})();
+
+var SLIDE_MS         = 5000 / SPEED;   // сколько живёт слайд
+var MIN_BEFORE_FINAL = 2500 / SPEED;   // сколько текущий слайд доигрывает перед финалом
+
+var LOOP_FROM = 1;    // по кругу крутятся слайды 2–5 (индексы 1–4)
+var LOOP_TO   = 4;
+var FINAL     = 5;    // «Готовься к службе»
+
+var slides = document.getElementsByClassName
+    ? document.getElementsByClassName('slide')
+    : document.querySelectorAll('.slide');
+
+var cur = -1, shownAt = 0, finalWanted = false;
+
+function now() { return new Date().getTime(); }
+
+function show(i) {
+    if (i === cur) return;
+    if (cur >= 0) slides[cur].className = slides[cur].className.replace(/\s*\bon\b/, '');
+    slides[i].className += ' on';
+    cur = i;
+    shownAt = now();
+}
+
+function tick() {
+    if (cur === FINAL) return;                          // финал держится до конца
+
+    var age = now() - shownAt;
+
+    if (finalWanted && age >= MIN_BEFORE_FINAL) { show(FINAL); return; }
+    if (age < SLIDE_MS) return;
+
+    var n = cur + 1;
+    if (n > LOOP_TO) n = LOOP_FROM;                     // логотип дважды не показываем
+    show(n);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   API ДВИЖКА
+
+   Имена и аргументы заданы GMod. Из всех событий слайдам нужно одно:
+   момент, когда загрузка подошла к концу. Остальные функции объявлены,
+   чтобы движок не упирался в их отсутствие, и хранят данные на случай,
+   если захочется что-то из них показать.
+   ═══════════════════════════════════════════════════════════════════════ */
+var engine = { details: null, filesTotal: 0, filesNeeded: 0, status: '' };
+
+window.GameDetails = function (servername, serverurl, mapname, maxplayers, steamid, gamemode) {
+    engine.details = { server: servername, map: mapname, max: maxplayers, gamemode: gamemode };
+};
+window.SetFilesTotal   = function (n) { engine.filesTotal  = Number(n) || 0; };
+window.SetFilesNeeded  = function (n) { engine.filesNeeded = Number(n) || 0; };
+window.DownloadingFile = function (f) { /* пофайлового вывода в этом дизайне нет */ };
+
+/*
+    Сигнал финала — начало загрузки Lua. Это заведомо поздняя стадия:
+    всё, что скачивается и монтируется, к этому моменту уже позади.
+    Статусы движок шлёт по-английски; если в вашей сборке строка другая,
+    поправьте регулярку — слайды продолжат крутиться, пока её нет.
+*/
+var FINAL_STATUS = /lua/i;
+
+window.SetStatusChanged = function (status) {
+    engine.status = String(status || '');
+    if (FINAL_STATUS.test(engine.status)) finalWanted = true;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ДЕМО
+   ═══════════════════════════════════════════════════════════════════════ */
+function runDemo() {
+    var seq = [
+        [0,     'Retrieving server info...'],
+        [2000,  'Mounting Addons'],
+        [4000,  'Workshop Complete'],
+        [32000, 'Sending client info...'],
+        [36000, 'Starting Lua...']
+    ];
+    for (var i = 0; i < seq.length; i++) {
+        (function (at, s) {
+            setTimeout(function () { SetStatusChanged(s); }, at / SPEED);
+        })(seq[i][0], seq[i][1]);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   СТАРТ
+   ═══════════════════════════════════════════════════════════════════════ */
+show(0);
+setInterval(tick, 200);
+
+if (/[?&]demo=1/.test(window.location.search)) runDemo();
+</script>
+</body>
+</html>
